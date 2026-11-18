@@ -8362,22 +8362,69 @@ struct Atlas
 			}
 			// Limit chart size, either to PackOptions::maxChartSize or maxResolution (if set), whichever is smaller.
 			// If limiting chart size to maxResolution, print a warning, since that may not be desirable to the user.
-			uint32_t maxChartSize = options.maxChartSize;
+			//
+			// The limit is expressed as a maximum core extent. A chart's reserved image is
+			// ftoi_ceil(maxTexcoord) + padding texels wide; the texel center alignment below turns the largest
+			// texcoord into core + 0.5 + padding, so the image is core + 2*padding + 1 texels. Block alignment
+			// additionally rounds the image up to a multiple of four. Both have to be reserved here, otherwise a
+			// chart can be scaled to a size whose reserved image is larger than an empty atlas: the packer never
+			// finds a location for it, asserts, and (in release builds) allocates atlases indefinitely. The old
+			// code also skipped the atlas limit entirely when maxChartSize >= maxResolution, which is exactly the
+			// combination that produced such charts.
+			const int blockAlignSizeOffset = options.padding * 2 + 1; // Texels the reserved image adds to the core extent.
+			int maxCoreExtent = options.maxChartSize > 0 ? (int)options.maxChartSize - 1 : INT_MAX; // Aligning to texel centers increases texel footprint by 1.
 			bool warnChartResized = false;
-			if (maxResolution > 0 && (maxChartSize == 0 || maxResolution < maxChartSize)) {
-				maxChartSize = maxResolution - options.padding * 2; // Don't include padding.
-				warnChartResized = true;
+			if (maxResolution > 0) {
+				// The reserved image may not exceed the atlas. A chart image uses core + 2*padding + 1 texels, and
+				// with block alignment that is rounded up to a multiple of four, so derive the limit from the
+				// block-aligned atlas size. This also applies when maxChartSize already limits the chart: the old
+				// code skipped the atlas limit whenever maxChartSize >= maxResolution, which produced charts whose
+				// reserved image is larger than an empty atlas - the packer could never place them, and in release
+				// builds it allocated atlases forever.
+				uint32_t imageBudget = maxResolution;
+				if (options.blockAlign)
+					imageBudget = imageBudget / 4 * 4;
+				const int atlasMaxCoreExtent = imageBudget > (uint32_t)blockAlignSizeOffset ? (int)(imageBudget - blockAlignSizeOffset) : 0;
+				if (atlasMaxCoreExtent < maxCoreExtent) {
+					maxCoreExtent = atlasMaxCoreExtent;
+					warnChartResized = true;
+				}
 			}
-			if (maxChartSize > 0) {
-				const float realMaxChartSize = (float)maxChartSize - 1.0f; // Aligning to texel centers increases texel footprint by 1.
-				if (extents.x > realMaxChartSize || extents.y > realMaxChartSize) {
-					if (warnChartResized)
-						XA_PRINT("   Resizing chart %u from %gx%g to %ux%u to fit atlas\n", c, extents.x, extents.y, maxChartSize, maxChartSize);
-					scale = realMaxChartSize / max(extents.x, extents.y);
-					for (uint32_t i = 0; i < chart->uniqueVertexCount(); i++) {
-						Vector2 &texcoord = chart->uniqueVertexAt(i);
-						texcoord = min(texcoord * scale, Vector2(realMaxChartSize));
+			if (options.blockAlign && maxCoreExtent != INT_MAX) {
+				// Block alignment rounds the core extent up so (core + offset) % 4 == 0. Round the limit down to the
+				// largest such extent so a clamped chart can be realigned without exceeding the limit again. When no
+				// non-negative aligned extent fits, keep the unaligned limit rather than collapsing the chart further.
+				const int alignedMax = (maxCoreExtent + blockAlignSizeOffset) / 4 * 4 - blockAlignSizeOffset;
+				if (alignedMax >= 0)
+					maxCoreExtent = alignedMax;
+			}
+			if (maxCoreExtent != INT_MAX && (extents.x > (float)maxCoreExtent || extents.y > (float)maxCoreExtent)) {
+				if (warnChartResized)
+					XA_PRINT("   Resizing chart %u from %gx%g to fit atlas\n", c, extents.x, extents.y);
+				const float clampScale = (float)maxCoreExtent / max(extents.x, extents.y);
+				for (uint32_t i = 0; i < chart->uniqueVertexCount(); i++) {
+					Vector2 &texcoord = chart->uniqueVertexAt(i);
+					texcoord = min(texcoord * clampScale, Vector2((float)maxCoreExtent));
+				}
+				extents.x = min(extents.x * clampScale, (float)maxCoreExtent);
+				extents.y = min(extents.y * clampScale, (float)maxCoreExtent);
+				if (options.blockAlign) {
+					// The uniform clamp above takes the chart off the 4x4 grid. Restore whole-block extents, which
+					// keeps the chart block aligned (placement searches on a 4x4 grid) and never exceeds the limit
+					// because maxCoreExtent satisfies (maxCoreExtent + offset) % 4 == 0.
+					int width = align(ftoi_ceil(extents.x) + blockAlignSizeOffset, 4) - blockAlignSizeOffset;
+					int height = align(ftoi_ceil(extents.y) + blockAlignSizeOffset, 4) - blockAlignSizeOffset;
+					width = min(width, maxCoreExtent);
+					height = min(height, maxCoreExtent);
+					if (extents.x > 0.0f && extents.y > 0.0f) {
+						for (uint32_t v = 0; v < chart->uniqueVertexCount(); v++) {
+							Vector2 &texcoord = chart->uniqueVertexAt(v);
+							texcoord.x = texcoord.x / extents.x * (float)width;
+							texcoord.y = texcoord.y / extents.y * (float)height;
+						}
 					}
+					extents.x = (float)width;
+					extents.y = (float)height;
 				}
 			}
 			// Align to texel centers and add padding offset.
@@ -8508,7 +8555,8 @@ struct Atlas
 #if XA_DEBUG
 				bool firstChartInBitImage = false;
 #endif
-				if (currentAtlas + 1 > m_bitImages.size()) {
+				const bool createdAtlas = currentAtlas + 1 > m_bitImages.size();
+				if (createdAtlas) {
 					// Chart doesn't fit in the current bitImage, create a new one.
 					BitImage *bi = XA_NEW_ARGS(MemTag::Default, BitImage, resolution, resolution);
 					m_bitImages.push_back(bi);
@@ -8531,6 +8579,16 @@ struct Atlas
 				}
 				if (foundLocation)
 					break;
+				if (createdAtlas) {
+					// The chart does not fit in an empty atlas. Charts are resized to fit the atlas above, so this
+					// only happens for degenerate configurations (e.g. resolution <= 2 * padding). Bailing out here
+					// keeps the packing loop from allocating atlases forever; the chart is placed at the atlas origin
+					// like any other chart, which mirrors what happens when a chart cannot be placed in a fixed-size
+					// atlas. Its vertices stay in range because they already carry the padding and texel center offset.
+					XA_PRINT_WARNING("PackCharts: chart %u (%ux%u) does not fit in a %ux%u atlas\n",
+						c, chartImageToPack->width(), chartImageToPack->height(), maxResolution, maxResolution);
+					break;
+				}
 				// Chart doesn't fit in the current bitImage, try the next one.
 				currentAtlas++;
 			}
@@ -8616,6 +8674,11 @@ struct Atlas
 		}
 		XA_PRINT("   %dx%d resolution\n", m_width, m_height);
 		m_utilization.resize(m_bitImages.size());
+		// The exported image is the window [padding, padding + m_width) x [padding, padding + m_height) of the
+		// packed bit image (see AtlasImage::copyTo), so utilization must be measured over that same window.
+		// Counting from (0, 0) instead measured the top-left padding ring and missed the bottom-right one,
+		// reporting a fill that does not match the image the caller receives.
+		const uint32_t utilPadding = options.padding;
 		for (uint32_t i = 0; i < m_utilization.size(); i++) {
 			if (m_width == 0 || m_height == 0)
 				m_utilization[i] = 0.0f;
@@ -8623,7 +8686,7 @@ struct Atlas
 				uint32_t count = 0;
 				for (uint32_t y = 0; y < m_height; y++) {
 					for (uint32_t x = 0; x < m_width; x++)
-						count += m_bitImages[i]->get(x, y);
+						count += m_bitImages[i]->get(x + utilPadding, y + utilPadding);
 				}
 				m_utilization[i] = float(count) / (m_width * m_height);
 			}
