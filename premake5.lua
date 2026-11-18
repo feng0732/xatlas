@@ -141,6 +141,36 @@ project "test"
 	filter "system:linux"
 		links { "pthread" }
 
+-- Parameterization failure tests. The "norecompute" variant is compiled with
+-- XA_RECOMPUTE_CHARTS=0 against its own xatlas object so that an
+-- unrecoverable chart stays ChartType::Invalid.
+project "test_parameterization_failure"
+	kind "ConsoleApp"
+	language "C++"
+	cppdialect "C++11"
+	exceptionhandling "Off"
+	rtti "Off"
+	warnings "Extra"
+	sanitizer()
+	includedirs { XATLAS_DIR }
+	files { "source/test/test_parameterization_failure.cpp", path.join(XATLAS_DIR, "xatlas.cpp"), path.join(XATLAS_DIR, "xatlas.h") }
+	filter "system:linux"
+		links { "pthread" }
+
+project "test_parameterization_failure_norecompute"
+	kind "ConsoleApp"
+	language "C++"
+	cppdialect "C++11"
+	exceptionhandling "Off"
+	rtti "Off"
+	warnings "Extra"
+	sanitizer()
+	includedirs { XATLAS_DIR }
+	defines { "XA_RECOMPUTE_CHARTS=0" }
+	files { "source/test/test_parameterization_failure_norecompute.cpp", path.join(XATLAS_DIR, "xatlas.cpp"), path.join(XATLAS_DIR, "xatlas.h") }
+	filter "system:linux"
+		links { "pthread" }
+
 project "viewer"
 	kind "ConsoleApp"
 	language "C++"
