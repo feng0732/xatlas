@@ -3862,8 +3862,10 @@ private:
 struct UvMeshChart
 {
 	Array<uint32_t> faces;
-	Array<uint32_t> indices;
-	uint32_t material;
+	Array<uint32_t> indices; // Chart-local vertex indices, 3 per face.
+	Array<uint32_t> sourceVertices; // Input mesh vertex index for each chart-local vertex, for Vertex::xref.
+	Array<uint32_t> sourceVertexToLocalVertex; // Sized to the mesh vertex count, UINT32_MAX for unused vertices.
+	uint32_t material = 0;
 };
 
 struct UvMesh
@@ -3872,15 +3874,13 @@ struct UvMesh
 	BitArray faceIgnore;
 	Array<uint32_t> faceMaterials;
 	Array<uint32_t> indices;
-	Array<Vector2> texcoords; // Copied from input and never modified, UvMeshInstance::texcoords are. Used to restore UvMeshInstance::texcoords so packing can be run multiple times.
+	Array<Vector2> texcoords; // Copied from input and never modified. Per-chart vertices are copied from here when packing, so packing can be run multiple times.
 	Array<UvMeshChart *> charts;
-	Array<uint32_t> vertexToChartMap;
 };
 
 struct UvMeshInstance
 {
 	UvMesh *mesh;
-	Array<Vector2> texcoords;
 };
 
 /*
@@ -6208,9 +6208,6 @@ struct ComputeUvMeshChartsTask
 		const uint32_t vertexCount = m_mesh->texcoords.size();
 		const uint32_t indexCount = m_mesh->indices.size();
 		const uint32_t faceCount = indexCount / 3;
-		// A vertex can only be assigned to one chart.
-		m_mesh->vertexToChartMap.resize(vertexCount);
-		m_mesh->vertexToChartMap.fill(UINT32_MAX);
 		// Map vertex UV to edge. Face is then edge / 3.
 		for (uint32_t i = 0; i < indexCount; i++)
 			m_uvToEdgeMap.add(m_mesh->texcoords[m_mesh->indices[i]]);
@@ -6226,6 +6223,8 @@ struct ComputeUvMeshChartsTask
 				continue;
 			// Face is OK, create a new chart with the face.
 			UvMeshChart *chart = XA_NEW(MemTag::Default, UvMeshChart);
+			chart->sourceVertexToLocalVertex.resize(vertexCount);
+			chart->sourceVertexToLocalVertex.fill(UINT32_MAX);
 			m_mesh->charts.push_back(chart);
 			chart->material = m_mesh->faceMaterials.isEmpty() ? 0 : m_mesh->faceMaterials[f];
 			addFaceToChart(chartIndex, f);
@@ -6268,11 +6267,6 @@ private:
 			if (m_mesh->faceMaterials[face] != m_mesh->charts[chartIndex]->material)
 				return false; // Materials don't match.
 		}
-		for (uint32_t i = 0; i < 3; i++) {
-			const uint32_t vertex = m_mesh->indices[face * 3 + i];
-			if (m_mesh->vertexToChartMap[vertex] != UINT32_MAX && m_mesh->vertexToChartMap[vertex] != chartIndex)
-				return false; // Vertex already assigned to another chart.
-		}
 		return true;
 	}
 
@@ -6283,8 +6277,17 @@ private:
 		chart->faces.push_back(face);
 		for (uint32_t i = 0; i < 3; i++) {
 			const uint32_t vertex = m_mesh->indices[face * 3 + i];
-			m_mesh->vertexToChartMap[vertex] = chartIndex;
-			chart->indices.push_back(vertex);
+			// A vertex shared by multiple charts (e.g. separate UV islands or materials
+			// sharing an input vertex) is duplicated: each chart gets its own chart-local
+			// vertex that can be transformed independently, while sourceVertices keeps the
+			// input vertex index so the output vertex remains traceable to the input.
+			uint32_t localVertex = chart->sourceVertexToLocalVertex[vertex];
+			if (localVertex == UINT32_MAX) {
+				localVertex = (uint32_t)chart->sourceVertices.size();
+				chart->sourceVertexToLocalVertex[vertex] = localVertex;
+				chart->sourceVertices.push_back(vertex);
+			}
+			chart->indices.push_back(localVertex);
 		}
 	}
 
@@ -8086,6 +8089,9 @@ struct Chart
 	const Array<uint32_t> *boundaryEdges;
 	// UvMeshChart only
 	Array<uint32_t> faces;
+	Array<Vector2> uvMeshVertices; // Chart-local vertices for UV mesh charts. "vertices" is a view of this.
+	Array<uint32_t> uvMeshIndices; // Chart-local indices for UV mesh charts. "indices" is a view of this.
+	Array<uint32_t> uvMeshSourceVertices; // Input mesh vertex index for each chart-local vertex, for Vertex::xref.
 
 	Vector2 &uniqueVertexAt(uint32_t v) { return uniqueVertices.isEmpty() ? vertices[v] : vertices[uniqueVertices[v]]; }
 	uint32_t uniqueVertexCount() const { return uniqueVertices.isEmpty() ? vertices.length : uniqueVertices.size(); }
@@ -8206,30 +8212,32 @@ struct Atlas
 
 	void addUvMeshCharts(UvMeshInstance *mesh)
 	{
-		// Copy texcoords from mesh.
-		mesh->texcoords.resize(mesh->mesh->texcoords.size());
-		memcpy(mesh->texcoords.data(), mesh->mesh->texcoords.data(), mesh->texcoords.size() * sizeof(Vector2));
-		BitArray vertexUsed(mesh->texcoords.size());
 		BoundingBox2D boundingBox;
 		for (uint32_t c = 0; c < mesh->mesh->charts.size(); c++) {
 			UvMeshChart *uvChart = mesh->mesh->charts[c];
 			Chart *chart = XA_NEW(MemTag::Default, Chart);
 			chart->atlasIndex = -1;
 			chart->material = uvChart->material;
-			chart->indices = uvChart->indices;
-			chart->vertices = mesh->texcoords;
-			chart->boundaryEdges = nullptr;
 			chart->faces.resize(uvChart->faces.size());
 			memcpy(chart->faces.data(), uvChart->faces.data(), sizeof(uint32_t) * uvChart->faces.size());
-			// Find unique vertices.
-			vertexUsed.zeroOutMemory();
-			for (uint32_t i = 0; i < chart->indices.length; i++) {
-				const uint32_t vertex = chart->indices[i];
-				if (!vertexUsed.get(vertex)) {
-					vertexUsed.set(vertex);
-					chart->uniqueVertices.push_back(vertex);
-				}
-			}
+			// Copy chart-local indices. Shared input vertices are duplicated per chart,
+			// so every index is already in the 0..sourceVertices.size() range.
+			chart->uvMeshIndices.resize(uvChart->indices.size());
+			memcpy(chart->uvMeshIndices.data(), uvChart->indices.data(), uvChart->indices.size() * sizeof(uint32_t));
+			chart->indices = chart->uvMeshIndices;
+			// Copy the chart-local vertices from the original (unmodified) input UVs.
+			// Each chart owns its vertices, so translating/rotating/scaling a chart during
+			// packing can't corrupt vertices shared with another chart.
+			chart->uvMeshSourceVertices.resize(uvChart->sourceVertices.size());
+			memcpy(chart->uvMeshSourceVertices.data(), uvChart->sourceVertices.data(), uvChart->sourceVertices.size() * sizeof(uint32_t));
+			chart->uvMeshVertices.resize(uvChart->sourceVertices.size());
+			for (uint32_t v = 0; v < uvChart->sourceVertices.size(); v++)
+				chart->uvMeshVertices[v] = mesh->mesh->texcoords[uvChart->sourceVertices[v]];
+			chart->vertices = chart->uvMeshVertices;
+			// All chart-local vertices are unique.
+			chart->uniqueVertices.resize(chart->uvMeshVertices.size());
+			for (uint32_t v = 0; v < chart->uniqueVertices.size(); v++)
+				chart->uniqueVertices[v] = v;
 			// Compute parametric and surface areas.
 			chart->parametricArea = 0.0f;
 			for (uint32_t f = 0; f < chart->indices.length / 3; f++) {
@@ -9525,6 +9533,16 @@ void ComputeCharts(Atlas *atlas, ChartOptions options)
 		XA_PRINT_MEM_USAGE
 	} else {
 		XA_PROFILE_START(computeChartsReal)
+		// Reset charts so ComputeCharts can be called multiple times without accumulating
+		// stale charts from a previous call.
+		for (uint32_t i = 0; i < ctx->uvMeshes.size(); i++) {
+			internal::UvMesh *uvMesh = ctx->uvMeshes[i];
+			for (uint32_t j = 0; j < uvMesh->charts.size(); j++) {
+				uvMesh->charts[j]->~UvMeshChart();
+				XA_FREE(uvMesh->charts[j]);
+			}
+			uvMesh->charts.clear();
+		}
 		if (!internal::segment::computeUvMeshCharts(ctx->taskScheduler, ctx->uvMeshes, ctx->progressFunc, ctx->progressUserData)) {
 			XA_PRINT("   Cancelled by user\n");
 			return;
@@ -9806,39 +9824,90 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 		for (uint32_t m = 0; m < ctx->uvMeshInstances.size(); m++) {
 			Mesh &outputMesh = atlas->meshes[m];
 			const internal::UvMeshInstance *mesh = ctx->uvMeshInstances[m];
-			// Alloc arrays.
-			outputMesh.vertexCount = mesh->texcoords.size();
+			const uint32_t inputVertexCount = mesh->mesh->texcoords.size();
+			const uint32_t chartCount = mesh->mesh->charts.size();
+			// Determine how many charts use each input vertex. Vertices used by more
+			// than one chart must be duplicated per chart; vertices with a single owner
+			// can reuse their mirror output vertex so that meshes without shared
+			// vertices produce identical output to the original implementation.
+			internal::Array<uint32_t> vertexChartUseCount(internal::MemTag::Default);
+			vertexChartUseCount.resize(inputVertexCount);
+			vertexChartUseCount.zeroOutMemory();
+			uint32_t splitVertexCount = 0;
+			for (uint32_t c = 0; c < chartCount; c++) {
+				const internal::UvMeshChart *uvChart = mesh->mesh->charts[c];
+				for (uint32_t v = 0; v < uvChart->sourceVertices.size(); v++) {
+					const uint32_t sourceVertex = uvChart->sourceVertices[v];
+					// Every use beyond the first needs its own duplicated output vertex.
+					if (vertexChartUseCount[sourceVertex] > 0)
+						splitVertexCount++;
+					vertexChartUseCount[sourceVertex]++;
+				}
+			}
+			// Alloc arrays. One output vertex per input vertex, plus one extra for each
+			// duplicated (shared) vertex beyond its first use.
+			outputMesh.vertexCount = inputVertexCount + splitVertexCount;
 			outputMesh.indexCount = mesh->mesh->indices.size();
-			outputMesh.chartCount = mesh->mesh->charts.size();
+			outputMesh.chartCount = chartCount;
 			outputMesh.vertexArray = XA_ALLOC_ARRAY(internal::MemTag::Default, Vertex, outputMesh.vertexCount);
 			outputMesh.indexArray = XA_ALLOC_ARRAY(internal::MemTag::Default, uint32_t, outputMesh.indexCount);
 			outputMesh.chartArray = XA_ALLOC_ARRAY(internal::MemTag::Default, Chart, outputMesh.chartCount);
 			XA_PRINT("   UV mesh %u: %u vertices, %u triangles, %u charts\n", m, outputMesh.vertexCount, outputMesh.indexCount / 3, outputMesh.chartCount);
-			// Copy mesh data.
-			// Vertices.
-			for (uint32_t v = 0; v < mesh->texcoords.size(); v++) {
+			// The first inputVertexCount output vertices mirror the input vertices.
+			// Vertices not used by any chart (including vertices of ignored faces) keep
+			// their original input UVs with invalid atlas/chart indices; vertices used by
+			// a chart are overwritten with packed UVs below.
+			for (uint32_t v = 0; v < inputVertexCount; v++) {
 				Vertex &vertex = outputMesh.vertexArray[v];
-				vertex.uv[0] = mesh->texcoords[v].x;
-				vertex.uv[1] = mesh->texcoords[v].y;
+				vertex.atlasIndex = -1;
+				vertex.chartIndex = -1;
+				vertex.uv[0] = mesh->mesh->texcoords[v].x;
+				vertex.uv[1] = mesh->mesh->texcoords[v].y;
 				vertex.xref = v;
-				const uint32_t meshChartIndex = mesh->mesh->vertexToChartMap[v];
-				if (meshChartIndex == UINT32_MAX) {
-					// Vertex doesn't exist in any chart.
-					vertex.atlasIndex = -1;
-					vertex.chartIndex = -1;
-				} else {
-					const internal::pack::Chart *chart = packAtlas.getChart(chartIndex + meshChartIndex);
-					vertex.atlasIndex = chart->atlasIndex;
-					vertex.chartIndex = (int32_t)chartIndex + meshChartIndex;
-				}
 			}
-			// Indices.
+			// Indices default to the original input indices: ignored faces keep pointing at
+			// the invalid mirror vertices, as they are not part of any chart.
 			memcpy(outputMesh.indexArray, mesh->mesh->indices.data(), mesh->mesh->indices.size() * sizeof(uint32_t));
-			// Charts.
-			for (uint32_t c = 0; c < mesh->mesh->charts.size(); c++) {
-				Chart *outputChart = &outputMesh.chartArray[c];
+			// Tracks how many charts have consumed each mirror/duplicate vertex.
+			internal::Array<uint32_t> vertexUseCount(internal::MemTag::Default);
+			vertexUseCount.resize(inputVertexCount);
+			vertexUseCount.zeroOutMemory();
+			uint32_t firstSplitVertex = inputVertexCount;
+			for (uint32_t c = 0; c < chartCount; c++) {
 				const internal::pack::Chart *chart = packAtlas.getChart(chartIndex);
 				XA_DEBUG_ASSERT(chart->atlasIndex >= 0);
+				XA_DEBUG_ASSERT(chart->uvMeshVertices.size() == chart->uvMeshSourceVertices.size());
+				// Map each chart-local vertex to its output vertex index. The first chart
+				// that uses a source vertex writes its mirror; later charts get appended
+				// duplicate vertices that remain traceable to the same input via xref.
+				internal::Array<uint32_t> localToOutputVertex(internal::MemTag::Default);
+				localToOutputVertex.resize(chart->uvMeshVertices.size());
+				for (uint32_t v = 0; v < chart->uvMeshVertices.size(); v++) {
+					const uint32_t sourceVertex = chart->uvMeshSourceVertices[v];
+					uint32_t outputVertex;
+					if (vertexUseCount[sourceVertex] == 0) {
+						outputVertex = sourceVertex; // Reuse the mirror vertex.
+					} else {
+						outputVertex = firstSplitVertex++; // Duplicate for this chart.
+						XA_DEBUG_ASSERT(outputVertex < outputMesh.vertexCount);
+						outputMesh.vertexArray[outputVertex].xref = sourceVertex;
+					}
+					vertexUseCount[sourceVertex]++;
+					Vertex &vertex = outputMesh.vertexArray[outputVertex];
+					vertex.atlasIndex = chart->atlasIndex;
+					vertex.chartIndex = (int32_t)chartIndex;
+					vertex.uv[0] = internal::max(0.0f, chart->uvMeshVertices[v].x);
+					vertex.uv[1] = internal::max(0.0f, chart->uvMeshVertices[v].y);
+					localToOutputVertex[v] = outputVertex;
+				}
+				// Indices. Chart face order is preserved; face indices stay in the input range.
+				for (uint32_t f = 0; f < chart->faces.size(); f++) {
+					const uint32_t outIndex = chart->faces[f] * 3;
+					for (uint32_t j = 0; j < 3; j++)
+						outputMesh.indexArray[outIndex + j] = localToOutputVertex[chart->uvMeshIndices[f * 3 + j]];
+				}
+				// Charts.
+				Chart *outputChart = &outputMesh.chartArray[c];
 				outputChart->atlasIndex = (uint32_t)chart->atlasIndex;
 				outputChart->faceCount = chart->faces.size();
 				outputChart->faceArray = XA_ALLOC_ARRAY(internal::MemTag::Default, uint32_t, outputChart->faceCount);
@@ -9847,6 +9916,7 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 					outputChart->faceArray[f] = chart->faces[f];
 				chartIndex++;
 			}
+			XA_DEBUG_ASSERT(outputMesh.vertexCount == firstSplitVertex);
 			if (ctx->progressFunc) {
 				const int newProgress = int((m + 1) / (float)atlas->meshCount * 100.0f);
 				if (newProgress != progress) {

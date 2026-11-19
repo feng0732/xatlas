@@ -141,9 +141,16 @@ bool generateAtlas(const char *filename, bool useUvMesh, AtlasResult *result)
 			} else {
 				// Index count shouldn't change.
 				ASSERT(mesh.indexCount == objMesh.indices.size());
+				// Every output vertex must be traceable to an input vertex.
+				for (uint32_t j = 0; j < mesh.vertexCount; j++)
+					ASSERT(mesh.vertexArray[j].xref < (uint32_t)(objMesh.texcoords.size() / 2));
+				// Every index must reference an output vertex.
+				for (uint32_t j = 0; j < mesh.indexCount; j++)
+					ASSERT(mesh.indexArray[j] < mesh.vertexCount);
+				// Vertex count can grow: a UV vertex shared by multiple charts is
+				// duplicated per chart, but can never be smaller than the input.
+				ASSERT(mesh.vertexCount >= objMesh.texcoords.size() / 2);
 			}
-			// Vertex count shouldn't change.
-			ASSERT(mesh.vertexCount == objMesh.texcoords.size() / 2);
 		} else {
 			// Index count shouldn't change.
 			ASSERT(mesh.indexCount == objMesh.indices.size());
